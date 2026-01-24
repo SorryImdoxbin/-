@@ -52,13 +52,13 @@ async def cmd_rules(message: Message):
 14. Вредоносы запрещены.
 
 👨‍💼 Администраторы:
-• cfg (https://t.me/cfgsp)
-• angelmaycry (https://t.me/gothboyclicue)
-• wheres (https://t.me/ghoul_001)
+• kroky (https://t.me/onion_kroky)
+• набор
+• набор
 
 🧰 Отработка логов:
-• plague (https://t.me/Plag1ue)
-• cfg (https://t.me/cfgsp)"""
+• 
+• kroky (https://t.me/onion_kroky)"""
     
     await message.answer(rules_text)
 
