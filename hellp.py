@@ -9,7 +9,7 @@ from aiogram.types import Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # Настройки
-BOT_TOKEN = "8371672396:AAFbLOfBkm0Q2L31tDSCPhM3jo_59_O2D7s"
+BOT_TOKEN = "8371672396:AAFAVqP2zruJp1_WkDDYQCsr5Oehit3cMPk"
 ADMIN_IDS = [7908573959]  # Сюда добавьте ID администраторов (например, [123456789, 987654321])
 
 # Настройка логирования
