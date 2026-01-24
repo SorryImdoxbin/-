@@ -58,7 +58,7 @@ async def cmd_rules(message: Message):
 
 🧰 Отработка логов:
 • mb 
-• kroky (https://t.me/cfgsp)"""
+• kroky (https://t.me/onion_kroky)"""
     
     await message.answer(rules_text)
 
