@@ -10,7 +10,7 @@ from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
 # Настройки
-BOT_TOKEN = "7908573959"  # <-- ЗАМЕНИТЕ НА РЕАЛЬНЫЙ ТОКЕН!
+BOT_TOKEN = "8418303801:AAEA_zSLKdAOWFV93BPi6mLlaxQWm7Tn9xg"  # <-- ЗАМЕНИТЕ НА РЕАЛЬНЫЙ ТОКЕН!
 
 # Настройка логирования
 logging.basicConfig(
