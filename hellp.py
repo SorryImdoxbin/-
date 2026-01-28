@@ -1,398 +1,282 @@
-import asyncio
-import logging
+import telebot
+import json
+from transliterate import translit
+from Levenshtein import ratio
+import speech_recognition as sr
+from io import BytesIO
+import uuid
+import os
+import requests
+import subprocess
 from datetime import datetime, timedelta
-from typing import Dict, Any
 
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from aiogram.types import Message
-from aiogram.enums import ParseMode
-from aiogram.client.default import DefaultBotProperties
-
-# Настройки
-BOT_TOKEN = "8418303801:AAEA_zSLKdAOWFV93BPi6mLlaxQWm7Tn9xg"  # <-- ЗАМЕНИТЕ НА РЕАЛЬНЫЙ ТОКЕН!
-
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-# Инициализация бота с настройками по умолчанию
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
-dp = Dispatcher()
-
-# Хранение данных о мутах
-user_mutes: Dict[int, Dict[str, Any]] = {}
-
-# Свободные айулауд аккаунты (пример данных)
-available_accounts = [
-    {"id": 1, "username": "account1", "status": "свободен"},
-    {"id": 2, "username": "account2", "status": "свободен"},
-    {"id": 3, "username": "account3", "status": "занят"},
-    {"id": 4, "username": "account4", "status": "свободен"},
-]
-
-async def is_admin(user_id: int, chat_id: int) -> bool:
-    """Проверяет, является ли пользователь администратором чата"""
+def load_settings():
     try:
-        chat_member = await bot.get_chat_member(chat_id, user_id)
-        return chat_member.status in ["creator", "administrator"]
-    except Exception as e:
-        logger.error(f"Ошибка при проверке прав: {e}")
-        return False
+        with open('settings.json', 'r', encoding='utf-8') as file:
+            settings = json.load(file)
+    except (FileNotFoundError, json.JSONDecodeError):
+        settings = {
+            "token": "8371672396:AAFAVqP2zruJp1_WkDDYQCsr5Oehit3cMPk",
+            "admins": ["7908573959"],
+            "ban_words": [],
+            "bot_active": True,
+            "check_message_active": "Ебашу на благо кого-то! ",
+            "check_message_inactive": "Чилю",
+            "match_threshold": 0.65
+        }
+        save_settings(settings)
+    return settings
 
-async def bot_has_permissions(chat_id: int) -> bool:
-    """Проверяет, есть ли у бота права на ограничение пользователей"""
+def save_settings(settings):
+    with open('settings.json', 'w', encoding='utf-8') as file:
+        json.dump(settings, file, ensure_ascii=False, indent=4)
+
+def load_statistics():
     try:
-        bot_member = await bot.get_chat_member(chat_id, (await bot.get_me()).id)
-        return (bot_member.status == "administrator" and 
-                bot_member.can_restrict_members)
-    except Exception as e:
-        logger.error(f"Ошибка при проверке прав бота: {e}")
-        return False
+        with open('stat_chat.json', 'r', encoding='utf-8') as file:
+            stats = json.load(file)
+    except (FileNotFoundError, json.JSONDecodeError):
+        stats = {
+            "messages": [],
+            "users": {}
+        }
+        save_statistics(stats)
+    return stats
 
-# ========== КОМАНДА /rules ==========
-@dp.message(Command("rules"))
-async def cmd_rules(message: Message):
-    rules_text = """⛔️ <b>Правила поведения в чате</b>
+def save_statistics(stats):
+    with open('stat_chat.json', 'w', encoding='utf-8') as file:
+        json.dump(stats, file, ensure_ascii=False, indent=4)
 
-1. Запрещена дискриминация.
-2. Запрещена реклама без согласования.
-3. Запрещён перелив трафика.
-4. Запрещена ложная информация.
-5. Запрещён 18+ / жесть.
-6. Запрещено обсуждение наркотиков и оружия.
-7. Мошенничество = бан.
-8. Сделки на свой страх и риск.
-9. Конфликт = мут всем.
-10. Запрещены массовые упоминания.
-11. Запрещено распространять личную инфу.
-12. Запрещено прикидываться админами.
-13. Репорт багов обязателен.
-14. Вредоносы запрещены.
+settings = load_settings()
+stats = load_statistics()
+admins = settings["admins"]
+ban_words = settings["ban_words"]
+bot_active = settings.get("bot_active", True)
 
-👨‍💼 <b>Администраторы:</b>
-• onion_kroky (https://t.me/onion_kroky)
+bot = telebot.TeleBot(settings["token"])
 
-🧰 <b>Отработка логов:</b>
-• onion_kroky (https://t.me/onion_kroky)"""
-    
-    await message.answer(rules_text)
+def contains_banned_word(text, ban_words, threshold):
+    text_lower = text.lower()
+    transliterated_text = translit(text_lower, 'ru')
+    for ban_word in ban_words:
+        if ban_word in text_lower or ban_word in transliterated_text:
+            return True
+        for word in text_lower.split():
+            if ratio(word, ban_word) > threshold or ratio(translit(word, 'ru'), ban_word) > threshold:
+                return True
+    return False
 
-# ========== КОМАНДА /mute ==========
-@dp.message(Command("mute"))
-async def cmd_mute(message: Message):
-    # Проверка что команда в группе/супергруппе
-    if message.chat.type not in ["group", "supergroup"]:
-        await message.reply("⚠️ Эта команда работает только в группах!")
+@bot.message_handler(content_types=['text'])
+def worker(message):
+    global bot_active
+    message_text = message.text.lower()
+    if message_text == '/banwords' and str(message.from_user.id) in admins:
+        bot.send_message(message.chat.id, ' ; '.join(ban_words))
         return
-    
-    # Проверка прав администратора через Telegram API
-    if not await is_admin(message.from_user.id, message.chat.id):
-        await message.reply("⛔ У вас нет прав для использования этой команды!")
+    if message_text == '/off' and str(message.from_user.id) in admins:
+        bot_active = False
+        settings["bot_active"] = bot_active
+        save_settings(settings)
+        bot.send_message(message.chat.id, "Бот отключен.")
         return
-    
-    # Проверка что у бота есть права
-    if not await bot_has_permissions(message.chat.id):
-        await message.reply("⚠️ У бота нет прав на ограничение пользователей!\n"
-                          "Дайте боту права администратора с разрешением 'Ограничивать пользователей'")
+
+    if message_text == '/on' and str(message.from_user.id) in admins:
+        bot_active = True
+        settings["bot_active"] = bot_active
+        save_settings(settings)
+        bot.send_message(message.chat.id, "Бот включен.")
         return
-    
-    # Проверка что команда ответ на сообщение
-    if not message.reply_to_message:
-        await message.reply("⚠️ Команда должна быть отправлена в ответ на сообщение пользователя!\n\nИспользуйте: <code>/mute 1h спам</code>")
-        return
-    
-    target_user = message.reply_to_message.from_user
-    
-    # Проверяем, что не пытаемся замутить самого себя
-    if target_user.id == message.from_user.id:
-        await message.reply("❌ Вы не можете замутить самого себя!")
-        return
-    
-    # Проверяем, что не пытаемся замутить бота
-    if target_user.id == (await bot.get_me()).id:
-        await message.reply("❌ Вы не можете замутить бота!")
-        return
-    
-    command_parts = message.text.split()
-    
-    if len(command_parts) < 3:
-        await message.reply("❌ Неправильный формат!\n\nИспользуйте: <code>/mute &lt;время&gt; &lt;причина&gt;</code>\n\nПример: <code>/mute 1h спам</code>\nДоступно: 30m, 1h, 2d")
-        return
-    
-    time_str = command_parts[1].lower()
-    reason = " ".join(command_parts[2:])
-    
-    # Парсинг времени
-    try:
-        if time_str.endswith('m'):  # минуты
-            minutes = int(time_str[:-1])
-            mute_duration = timedelta(minutes=minutes)
-            time_display = f"{minutes} мин."
-        elif time_str.endswith('h'):  # часы
-            hours = int(time_str[:-1])
-            mute_duration = timedelta(hours=hours)
-            time_display = f"{hours} час."
-        elif time_str.endswith('d'):  # дни
-            days = int(time_str[:-1])
-            mute_duration = timedelta(days=days)
-            time_display = f"{days} дн."
+
+    if message_text == '/check':
+        if bot_active:
+            bot.send_message(message.chat.id, settings["check_message_active"])
         else:
-            minutes = int(time_str)
-            mute_duration = timedelta(minutes=minutes)
-            time_display = f"{minutes} мин."
-    except ValueError:
-        await message.reply("❌ Неверный формат времени!\n\nИспользуйте: <code>30m</code> (минуты), <code>1h</code> (часы), <code>2d</code> (дни)")
+            bot.send_message(message.chat.id, settings["check_message_inactive"])
         return
-    
-    # Проверяем, что время не слишком большое
-    if mute_duration > timedelta(days=366):
-        await message.reply("❌ Слишком большой срок мута! Максимум 366 дней.")
-        return
-    
-    mute_until = datetime.now() + mute_duration
-    
-    # Сохраняем информацию о муте
-    user_mutes[target_user.id] = {
-        'until': mute_until,
-        'reason': reason,
-        'admin': message.from_user.username or f"ID: {message.from_user.id}",
-        'chat_id': message.chat.id
-    }
-    
-    # Ограничиваем права пользователя
-    try:
-        until_timestamp = int(mute_until.timestamp())
-        permissions = types.ChatPermissions(
-            can_send_messages=False,
-            can_send_media_messages=False,
-            can_send_polls=False,
-            can_send_other_messages=False,
-            can_add_web_page_previews=False,
-            can_change_info=False,
-            can_invite_users=False,
-            can_pin_messages=False
-        )
-        
-        await bot.restrict_chat_member(
-            chat_id=message.chat.id,
-            user_id=target_user.id,
-            permissions=permissions,
-            until_date=until_timestamp
-        )
-        
-        # Уведомление в чат
-        target_name = f"@{target_user.username}" if target_user.username else f"Пользователь (ID: {target_user.id})"
-        admin_name = f"@{message.from_user.username}" if message.from_user.username else f"Админ (ID: {message.from_user.id})"
-        
-        mute_message = f"""
-🔇 <b>Пользователь получил мут!</b>
 
-👤 {target_name}
-⏰ <b>Срок:</b> {time_display}
-📝 <b>Причина:</b> {reason}
-👮‍♂️ <b>Администратор:</b> {admin_name}
-🕐 <b>Мут до:</b> {mute_until.strftime('%d.%m.%Y %H:%M')}
-        """
-        await message.reply(mute_message)
-        
-    except Exception as e:
-        logger.error(f"Ошибка при выдаче мута: {e}")
-        error_msg = str(e).lower()
-        if "not enough rights" in error_msg or "can't restrict" in error_msg:
-            await message.reply("❌ У бота нет прав на ограничение пользователей!\n"
-                              "Дайте боту права администратора с разрешением 'Ограничивать пользователей'")
-        elif "user is an administrator" in error_msg:
-            await message.reply("❌ Нельзя замутить администратора чата!")
+    if message_text == '/stat' and str(message.from_user.id) in admins:
+        send_chat_statistics(message.chat.id)
+        return
+
+    if not bot_active:
+        return
+
+    if message_text.startswith('/add_banword') and str(message.from_user.id) in admins:
+        parts = message_text.split(maxsplit=1)
+        if len(parts) > 1:
+            new_word = parts[1].strip().lower()
+            if new_word not in ban_words:
+                ban_words.append(new_word)
+                settings["ban_words"] = ban_words
+                save_settings(settings)
+                bot.send_message(message.chat.id, f"Слово '{new_word}' добавлено в список запрещённых.")
+            else:
+                bot.send_message(message.chat.id, f"Слово '{new_word}' уже есть в списке запрещённых.")
         else:
-            await message.reply(f"❌ Произошла ошибка: {str(e)[:100]}")
+            bot.send_message(message.chat.id, "Использование: /add_banword <слово>")
+        return
 
-# ========== КОМАНДА /unmute ==========
-@dp.message(Command("unmute"))
-async def cmd_unmute(message: Message):
-    # Проверка что команда в группе/супергруппе
-    if message.chat.type not in ["group", "supergroup"]:
-        await message.reply("⚠️ Эта команда работает только в группах!")
-        return
-    
-    # Проверка прав администратора через Telegram API
-    if not await is_admin(message.from_user.id, message.chat.id):
-        await message.reply("⛔ У вас нет прав для использования этой команды!")
-        return
-    
-    # Проверка что у бота есть права
-    if not await bot_has_permissions(message.chat.id):
-        await message.reply("⚠️ У бота нет прав на ограничение пользователей!\n"
-                          "Дайте боту права администратора с разрешением 'Ограничивать пользователей'")
-        return
-    
-    # Проверка что команда ответ на сообщение
-    if not message.reply_to_message:
-        await message.reply("⚠️ Команда должна быть отправлена в ответ на сообщение пользователя!")
-        return
-    
-    target_user = message.reply_to_message.from_user
-    
-    # Восстанавливаем права пользователя
-    try:
-        permissions = types.ChatPermissions(
-            can_send_messages=True,
-            can_send_media_messages=True,
-            can_send_polls=True,
-            can_send_other_messages=True,
-            can_add_web_page_previews=True,
-            can_change_info=False,
-            can_invite_users=False,
-            can_pin_messages=False
-        )
-        
-        await bot.restrict_chat_member(
-            chat_id=message.chat.id,
-            user_id=target_user.id,
-            permissions=permissions
-        )
-        
-        # Удаляем информацию о муте
-        if target_user.id in user_mutes:
-            del user_mutes[target_user.id]
-        
-        # Уведомление в чат
-        target_name = f"@{target_user.username}" if target_user.username else f"Пользователь (ID: {target_user.id})"
-        admin_name = f"@{message.from_user.username}" if message.from_user.username else f"Админ (ID: {message.from_user.id})"
-        
-        unmute_message = f"""
-🔊 <b>Пользователь размучен!</b>
-
-👤 {target_name}
-👮‍♂️ <b>Администратор:</b> {admin_name}
-        """
-        await message.reply(unmute_message)
-        
-    except Exception as e:
-        logger.error(f"Ошибка при снятии мута: {e}")
-        error_msg = str(e).lower()
-        if "not enough rights" in error_msg or "can't restrict" in error_msg:
-            await message.reply("❌ У бота нет прав на ограничение пользователей!\n"
-                              "Дайте боту права администратора с разрешением 'Ограничивать пользователей'")
-        elif "user is an administrator" in error_msg:
-            await message.reply("❌ Этот пользователь администратор, у него нет мута!")
-        elif "chat not found" in error_msg:
-            await message.reply("❌ Пользователь не найден в этом чате!")
+    if message_text.startswith('/del_banword') and str(message.from_user.id) in admins:
+        parts = message_text.split(maxsplit=1)
+        if len(parts) > 1:
+            word_to_remove = parts[1].strip().lower()
+            if word_to_remove in ban_words:
+                ban_words.remove(word_to_remove)
+                settings["ban_words"] = ban_words
+                save_settings(settings)
+                bot.send_message(message.chat.id, f"Слово '{word_to_remove}' удалено из списка запрещённых.")
+            else:
+                bot.send_message(message.chat.id, f"Слова '{word_to_remove}' нет в списке запрещённых.")
         else:
-            await message.reply(f"❌ Произошла ошибка: {str(e)[:100]}")
-
-# ========== КОМАНДА /check ==========
-@dp.message(Command("check"))
-async def cmd_check(message: Message):
-    # Проверка прав администратора через Telegram API
-    if not await is_admin(message.from_user.id, message.chat.id):
-        await message.reply("⛔ У вас нет прав для использования этой команды!")
+            bot.send_message(message.chat.id, "Использование: /del_banword <слово>")
         return
-    
-    # Фильтруем свободные аккаунты
-    free_accounts = [acc for acc in available_accounts if acc["status"] == "свободен"]
-    
-    if not free_accounts:
-        response = "❌ <b>Нет свободных айулауд аккаунтов.</b>"
+
+    if message_text == '/add_admin' and str(message.from_user.id) in admins and message.reply_to_message:
+        new_admin = str(message.reply_to_message.from_user.id)
+        if new_admin not in admins:
+            admins.append(new_admin)
+            settings["admins"] = admins
+            save_settings(settings)
+            bot.send_message(message.chat.id, f"Пользователь '{message.reply_to_message.from_user.username}' добавлен в список администраторов.")
+        else:
+            bot.send_message(message.chat.id, f"Пользователь '{message.reply_to_message.from_user.username}' уже есть в списке администраторов.")
+        return
+
+    if message_text == '/del_admin' and str(message.from_user.id) in admins and message.reply_to_message:
+        admin_to_remove = str(message.reply_to_message.from_user.id)
+        if admin_to_remove in admins:
+            admins.remove(admin_to_remove)
+            settings["admins"] = admins
+            save_settings(settings)
+            bot.send_message(message.chat.id, f"Пользователь '{message.reply_to_message.from_user.username}' удален из списка администраторов.")
+        else:
+            bot.send_message(message.chat.id, f"Пользователя '{message.reply_to_message.from_user.username}' нет в списке администраторов.")
+        return
+
+    if message_text.startswith('/del_all') and str(message.from_user.id) in admins and message.reply_to_message:
+        del_all_messages(message.chat.id, message.reply_to_message.message_id)
+        return
+
+    if message_text.startswith('/mute') and str(message.from_user.id) in admins and message.reply_to_message:
+        parts = message_text.split(maxsplit=1)
+        if len(parts) > 1 and parts[1].isdigit():
+            mute_duration = int(parts[1])
+            mute_user(message.chat.id, message.reply_to_message.from_user.id, mute_duration)
+            bot.send_message(message.chat.id, f"Пользователь {message.reply_to_message.from_user.username} замьючен на {mute_duration} минут.")
+        else:
+            bot.send_message(message.chat.id, "Использование: /mute <минуты>")
+        return
+
+    if message_text.startswith('/unmute') and str(message.from_user.id) in admins and message.reply_to_message:
+        unmute_user(message.chat.id, message.reply_to_message.from_user.id)
+        bot.send_message(message.chat.id, f"Пользователь {message.reply_to_message.from_user.username} размьючен.")
+        return
+
+    if contains_banned_word(message.text, ban_words, settings["match_threshold"]):
+        bot.delete_message(message.chat.id, message.message_id)
     else:
-        response = "✅ <b>Свободные айулауд аккаунты:</b>\n\n"
-        for acc in free_accounts:
-            response += f"• <b>ID:</b> {acc['id']}\n"
-            response += f"  <b>Имя:</b> {acc['username']}\n"
-            response += f"  <b>Статус:</b> {acc['status']}\n\n"
-    
-    await message.reply(response)
+        update_message_statistics(message)
 
-# ========== ПРОВЕРКА МУТОВ ПРИ НАПИСАНИИ СООБЩЕНИЯ ==========
-@dp.message()
-async def check_mute(message: Message):
-    # Пропускаем команды и сообщения в личных чатах
-    if message.chat.type == "private" or (message.text and message.text.startswith('/')):
+@bot.edited_message_handler(content_types=['text'])
+def edited_message_worker(message):
+    if bot_active and contains_banned_word(message.text, ban_words, settings["match_threshold"]):
+        bot.delete_message(message.chat.id, message.message_id)
+
+@bot.message_handler(content_types=['voice'])
+def get_audio_messages(message):
+    try:
+        file_info = bot.get_file(message.voice.file_id)
+        path = file_info.file_path
+        fname = os.path.basename(path)
+        doc = requests.get('https://api.telegram.org/file/bot{0}/{1}'.format(settings["token"], file_info.file_path))
+        with open(fname+'.oga', 'wb') as f:
+            f.write(doc.content)
+        process = subprocess.run(['ffmpeg', '-i', fname+'.oga', fname+'.wav'])
+        result = audio_to_text(fname+'.wav')
+        if contains_banned_word(result, ban_words, settings["match_threshold"]):
+            bot.delete_message(message.chat.id, message.message_id)
+    except sr.UnknownValueError as e:
         return
-    
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-    
-    # Проверяем есть ли мут для этого пользователя в этом чате
-    if user_id in user_mutes:
-        mute_info = user_mutes[user_id]
-        
-        # Проверяем что мут для этого чата
-        if mute_info.get('chat_id') != chat_id:
-            return
-        
-        # Проверяем не истек ли мут
-        if datetime.now() >= mute_info['until']:
-            # Мут истек, удаляем
-            del user_mutes[user_id]
-            return
-        
-        # Пользователь в муте, удаляем его сообщение
-        try:
-            await message.delete()
-            
-            # Информируем пользователя (если возможно)
-            try:
-                time_left = mute_info['until'] - datetime.now()
-                hours_left = time_left.total_seconds() // 3600
-                minutes_left = (time_left.total_seconds() % 3600) // 60
-                
-                warning = f"""
-⛔ <b>Вы в муте!</b>
-
-📝 <b>Причина:</b> {mute_info['reason']}
-⏳ <b>Осталось времени:</b> {int(hours_left)}ч {int(minutes_left)}м
-👮‍♂️ <b>Администратор:</b> {mute_info['admin']}
-                """
-                
-                await bot.send_message(
-                    chat_id=user_id,
-                    text=warning
-                )
-            except Exception as e:
-                logger.debug(f"Не удалось отправить сообщение пользователю: {e}")
-                    
-        except Exception as e:
-            logger.error(f"Ошибка при удалении сообщения: {e}")
-            # Если не можем удалить сообщение, игнорируем
-
-# ========== ФУНКЦИЯ ДЛЯ ДОБАВЛЕНИЯ БОТА В ГРУППУ ==========
-async def setup_bot_commands():
-    commands = [
-        types.BotCommand(command="/rules", description="Показать правила чата"),
-        types.BotCommand(command="/mute", description="Выдать мут пользователю"),
-        types.BotCommand(command="/unmute", description="Снять мут с пользователя"),
-        types.BotCommand(command="/check", description="Проверить свободные аккаунты"),
-    ]
-    try:
-        await bot.set_my_commands(commands)
-        logger.info("Команды бота установлены")
     except Exception as e:
-        logger.error(f"Ошибка при установке команд: {e}")
-
-# ========== ЗАПУСК БОТА ==========
-async def main():
-    try:
-        # Проверяем токен бота
-        bot_info = await bot.get_me()
-        logger.info(f"Бот запущен: @{bot_info.username} ({bot_info.id})")
-        
-        await setup_bot_commands()
-        logger.info("Бот готов к работе!")
-        
-        await dp.start_polling(bot)
-    except Exception as e:
-        logger.error(f"Ошибка запуска бота: {e}")
-        if "Unauthorized" in str(e):
-            logger.error("Неверный токен бота! Проверьте BOT_TOKEN в коде.")
+        bot.send_message(message.from_user.id, e)
     finally:
-        await bot.session.close()
+        os.remove(fname+'.wav')
+        os.remove(fname+'.oga')
 
-if __name__ == "__main__":
-    asyncio.run(main())
+def audio_to_text(dest_name: str):
+    r = sr.Recognizer()
+    message = sr.AudioFile(dest_name)
+    with message as source:
+        audio = r.record(source)
+    result = r.recognize_google(audio, language="ru_RU")
+    return result
+
+def del_all_messages(chat_id, until_message_id):
+    try:
+        last_message_id = bot.send_message(chat_id, "Удаляю сообщения...").message_id
+        for message_id in range(last_message_id, until_message_id, -1):
+            try:
+                bot.delete_message(chat_id, message_id)
+            except Exception as e:
+                pass
+    except Exception as e:
+        bot.send_message(chat_id, f"Ошибка при удалении сообщений: {e}")
+
+def mute_user(chat_id, user_id, duration):
+    until_date = datetime.now() + timedelta(minutes=duration)
+    bot.restrict_chat_member(chat_id, user_id, can_send_messages=False, until_date=until_date)
+
+def unmute_user(chat_id, user_id):
+    bot.restrict_chat_member(chat_id, user_id, can_send_messages=True, can_send_media_messages=True, can_send_polls=True, can_send_other_messages=True, can_add_web_page_previews=True)
+
+def update_message_statistics(message):
+    user_id = str(message.from_user.id)
+    timestamp = datetime.now().timestamp()
+    stats['messages'].append({
+        "user_id": user_id,
+        "timestamp": timestamp
+    })
+    if user_id not in stats['users']:
+        stats['users'][user_id] = {
+            "username": message.from_user.username,
+            "messages_count": 0
+        }
+    stats['users'][user_id]['messages_count'] += 1
+    save_statistics(stats)
+
+def send_chat_statistics(chat_id):
+    try:
+        chat = bot.get_chat(chat_id)
+        members_count = bot.get_chat_members_count(chat_id)
+        admins = bot.get_chat_administrators(chat_id)
+        admins_usernames = [admin.user.username for admin in admins]
+
+        now = datetime.now()
+        one_day_ago = now - timedelta(days=1)
+        one_week_ago = now - timedelta(weeks=1)
+        one_month_ago = now - timedelta(days=30)
+
+        total_messages = len(stats['messages'])
+        messages_today = len([msg for msg in stats['messages'] if datetime.fromtimestamp(msg['timestamp']) > one_day_ago])
+        messages_week = len([msg for msg in stats['messages'] if datetime.fromtimestamp(msg['timestamp']) > one_week_ago])
+        messages_month = len([msg for msg in stats['messages'] if datetime.fromtimestamp(msg['timestamp']) > one_month_ago])
+
+        top_users = sorted(stats['users'].items(), key=lambda item: item[1]['messages_count'], reverse=True)[:3]
+        top_users_info = [f"@{user['username']} ({user['messages_count']} сообщений)" for user_id, user in top_users]
+
+        stats_message = (f" Статистика чта:\n"
+                         f"Название: {chat.title}\n"
+                         f"Количество участников: {members_count}\n"
+                         f"Количество администраторов: {len(admins)}\n"
+                         f"Администраторы: {', '.join(admins_usernames)}\n\n"
+                         f"Всего сообщений: {total_messages}\n"
+                         f"Сообщений за сегодня: {messages_today}\n"
+                         f"Сообщений за неделю: {messages_week}\n"
+                         f"Сообщений за месяц: {messages_month}\n\n"
+                         f"Топ 3 пользователя по количеству сообщений:\n"
+                         f"{'; '.join(top_users_info)}")
+        bot.send_message(chat_id, stats_message)
+    except Exception as e:
+        bot.send_message(chat_id, f"Ошибка при получении статистики: {e}")
+
+bot.polling()
